@@ -1,7 +1,8 @@
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { describe, expect, it, vi } from 'vitest'
-import App, { exportCaptureSize } from './App'
+import App from './App'
+import { exportCaptureSize } from './lib/export-capture'
 
 vi.mock('html-to-image', () => ({ toCanvas: vi.fn() }))
 
@@ -41,6 +42,53 @@ describe('image viewer', () => {
     })
   })
 
+  it('exports an uploaded image without cache-busting its blob URL', async () => {
+    const { toCanvas } = await import('html-to-image')
+    const canvas = { toBlob: (callback: BlobCallback) => callback(new Blob(['png'], { type: 'image/png' })) } as HTMLCanvasElement
+    vi.mocked(toCanvas).mockClear()
+    vi.mocked(toCanvas).mockResolvedValue(canvas)
+
+    const originalCreateObjectURL = URL.createObjectURL
+    const originalRevokeObjectURL = URL.revokeObjectURL
+    const anchorClick = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined)
+    Object.defineProperty(URL, 'createObjectURL', {
+      configurable: true,
+      value: vi.fn(() => 'blob:custom-image'),
+    })
+    Object.defineProperty(URL, 'revokeObjectURL', {
+      configurable: true,
+      value: vi.fn(),
+    })
+
+    let unmount: (() => void) | undefined
+    try {
+      const user = userEvent.setup()
+      unmount = render(<App />).unmount
+      const file = new File(['image bytes'], 'my-photo.png', { type: 'image/png' })
+
+      await user.upload(screen.getByLabelText('Choose an image'), file)
+      await user.click(screen.getByRole('tab', { name: 'Export' }))
+      await user.click(screen.getByRole('button', { name: 'Export image' }))
+
+      await waitFor(() => expect(toCanvas).toHaveBeenCalledOnce())
+      expect(vi.mocked(toCanvas).mock.calls[0][1]).toMatchObject({ cacheBust: false })
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    } finally {
+      unmount?.()
+      anchorClick.mockRestore()
+      if (originalCreateObjectURL) {
+        Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: originalCreateObjectURL })
+      } else {
+        delete (URL as { createObjectURL?: typeof URL.createObjectURL }).createObjectURL
+      }
+      if (originalRevokeObjectURL) {
+        Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: originalRevokeObjectURL })
+      } else {
+        delete (URL as { revokeObjectURL?: typeof URL.revokeObjectURL }).revokeObjectURL
+      }
+    }
+  })
+
   it('starts with the sample image and a fit view', () => {
     render(<App />)
 
@@ -48,6 +96,59 @@ describe('image viewer', () => {
     expect(screen.queryByLabelText('Zoom percentage')).not.toBeInTheDocument()
     expect(screen.getByText('steve-jobs.png')).toBeInTheDocument()
     expect(screen.getByLabelText('File name')).toHaveValue('steve-jobs.png')
+  })
+
+  it('can export a window without an image', async () => {
+    const { toCanvas } = await import('html-to-image')
+    const canvas = { toBlob: (callback: BlobCallback) => callback(new Blob(['png'], { type: 'image/png' })) } as HTMLCanvasElement
+    vi.mocked(toCanvas).mockClear()
+    vi.mocked(toCanvas).mockResolvedValue(canvas)
+    const originalCreateObjectURL = URL.createObjectURL
+    const originalRevokeObjectURL = URL.revokeObjectURL
+    let downloadName = ''
+    const anchorClick = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(function (this: HTMLAnchorElement) {
+      downloadName = this.download
+    })
+    Object.defineProperty(URL, 'createObjectURL', {
+      configurable: true,
+      value: vi.fn(() => 'blob:window-download'),
+    })
+    Object.defineProperty(URL, 'revokeObjectURL', {
+      configurable: true,
+      value: vi.fn(),
+    })
+
+    try {
+      const user = userEvent.setup()
+      render(<App />)
+      await user.click(screen.getByRole('button', { name: 'No image' }))
+
+      expect(screen.queryByRole('img')).not.toBeInTheDocument()
+      expect(screen.getByLabelText('Window title')).toHaveValue('window')
+      expect(screen.queryByLabelText('Image width')).not.toBeInTheDocument()
+
+      await user.click(screen.getByRole('tab', { name: 'Export' }))
+      const exportedWindow = screen.getByTestId('export-window-frame').querySelector('.viewer-window') as HTMLElement
+      expect(exportedWindow.querySelector('img')).toBeNull()
+      await user.click(screen.getByRole('button', { name: 'Export image' }))
+
+      await waitFor(() => expect(anchorClick).toHaveBeenCalledOnce())
+      expect(vi.mocked(toCanvas).mock.calls[0][0]).toBe(exportedWindow)
+      expect(downloadName).toBe('window.png')
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    } finally {
+      anchorClick.mockRestore()
+      if (originalCreateObjectURL) {
+        Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: originalCreateObjectURL })
+      } else {
+        delete (URL as { createObjectURL?: typeof URL.createObjectURL }).createObjectURL
+      }
+      if (originalRevokeObjectURL) {
+        Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: originalRevokeObjectURL })
+      } else {
+        delete (URL as { revokeObjectURL?: typeof URL.revokeObjectURL }).revokeObjectURL
+      }
+    }
   })
 
   it('updates the image window title when changing the image file', async () => {
@@ -535,9 +636,36 @@ describe('image viewer', () => {
     const height = screen.getByLabelText('Export height')
     expect(within(exportControls).getByRole('tab', { name: 'Custom' })).toHaveAttribute('data-state', 'active')
     expect(width).toHaveValue(100)
-    expect(height).toHaveValue(813)
+    expect(height).toHaveValue(64)
     expect(exportWindow).toHaveAttribute('data-export-width', '100')
-    expect(exportWindow).toHaveAttribute('data-export-height', '813')
+    expect(exportWindow).toHaveAttribute('data-export-height', '64')
+  })
+
+  it('keeps Settings values unchanged after changing export dimensions repeatedly', async () => {
+    const user = userEvent.setup()
+    render(<App />)
+
+    const settingsWindow = screen.getByLabelText('Image viewer')
+    const settingsImage = screen.getByRole('img', { name: 'Sample image' })
+    expect(settingsWindow).toHaveStyle({ width: '760px', height: '610px' })
+    expect(settingsImage).toHaveStyle({ width: '627px', height: '470px' })
+
+    await user.click(screen.getByRole('tab', { name: 'Export' }))
+    const exportControls = screen.getByLabelText('Export size presets')
+    await user.click(within(exportControls).getByRole('tab', { name: 'Large' }))
+    expect(screen.getByLabelText('Export width')).toHaveValue(2048)
+    expect(screen.getByLabelText('Export height')).toHaveValue(1644)
+
+    await user.click(screen.getByRole('tab', { name: 'Settings' }))
+    expect(screen.getByLabelText('Image viewer')).toHaveStyle({ width: '760px', height: '610px' })
+    expect(screen.getByRole('img', { name: 'Sample image' })).toHaveStyle({ width: '627px', height: '470px' })
+
+    await user.click(screen.getByRole('tab', { name: 'Export' }))
+    await user.click(within(screen.getByLabelText('Export size presets')).getByRole('tab', { name: 'Large' }))
+    await user.click(screen.getByRole('tab', { name: 'Settings' }))
+
+    expect(screen.getByLabelText('Image viewer')).toHaveStyle({ width: '760px', height: '610px' })
+    expect(screen.getByRole('img', { name: 'Sample image' })).toHaveStyle({ width: '627px', height: '470px' })
   })
 
   it('drags the export preview only from its menu bar', async () => {

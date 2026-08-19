@@ -5,6 +5,7 @@ import { Button } from '@/components/ui/button'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { TabItem, TabPanel, Tabs, TabsList } from '@/components/ui/tabs'
 import { Tooltip, TooltipProvider } from '@/components/ui/tooltip'
+import { exportCaptureSize } from '@/lib/export-capture'
 
 const SAMPLE_IMAGE = '/sample-image.jpg'
 const WINDOW_BAR_HEIGHT = 24
@@ -71,15 +72,6 @@ const SHADOW_PRESETS: Record<Exclude<ShadowPreset, 'custom'>, WindowShadow> = {
   big: { y: 18, blur: 50, opacity: 0.55 },
 }
 
-export function exportCaptureSize(windowSize: WindowSize, shadow: WindowShadow) {
-  const padding = Math.ceil(shadow.blur + Math.abs(shadow.y))
-  return {
-    width: windowSize.width + padding * 2,
-    height: windowSize.height + padding * 2,
-    padding,
-  }
-}
-
 const RESIZE_HIT_AREA = 8
 
 function clampWindowSize({ width, height }: WindowSize, bounds: WindowBounds): WindowSize {
@@ -128,6 +120,16 @@ function contentWindowSizeForImage(imageWidth: number, imageHeight: number, padd
   }
 }
 
+function imageSizeForWindow(imageSize: WindowSize, windowSize: WindowSize, padding: Padding, keepAspectRatio: boolean): WindowSize {
+  const stagePadding = stagePaddingForWindow(padding, windowSize)
+  const uiScale = Math.max(1, windowSize.width / 760)
+  const maxWidth = Math.max(1, windowSize.width - stagePadding.side * 2)
+  const maxHeight = Math.max(1, windowSize.height - WINDOW_BAR_HEIGHT * uiScale - stagePadding.top - stagePadding.bottom)
+  return keepAspectRatio
+    ? imageSizeWithin(imageSize.width, imageSize.height, maxWidth, maxHeight) ?? imageSize
+    : { width: Math.min(imageSize.width, maxWidth), height: Math.min(imageSize.height, maxHeight) }
+}
+
 function stagePaddingForWindow(padding: Padding, { width, height }: WindowSize): Padding {
   return {
     top: Math.min(padding.top, Math.round(height * 0.08)),
@@ -171,7 +173,7 @@ function exportFileName(fileName: string, format: ExportFormat) {
 
 type MacWindowProps = {
   fileName: string
-  imageSrc: string
+  imageSrc: string | null
   imageDisplaySize: WindowSize
   uiScale: number
   stageStyle: CSSProperties
@@ -201,21 +203,23 @@ function MacWindow({ fileName, imageSrc, imageDisplaySize, uiScale, stageStyle, 
         style={{ ...stageStyle, overflow: 'hidden' }}
       >
         <div className="image-frame">
-          <div
-            {...imageResizeProps}
-            className={`image-resize-box${imageResizeProps ? ' is-resizable' : ''}${imageResizeProps?.className ? ` ${imageResizeProps.className}` : ''}`}
-            style={{ width: `${imageDisplaySize.width}px`, height: `${imageDisplaySize.height}px`, ...imageResizeProps?.style }}
-          >
-            <img
-              ref={imageRef}
-              className="viewer-image"
-              src={imageSrc}
-              alt={fileName === 'steve-jobs.png' ? 'Sample image' : fileName}
-              style={{ width: `${imageDisplaySize.width}px`, height: `${imageDisplaySize.height}px`, objectFit: 'fill' }}
-              onLoad={onImageLoad}
-              draggable={false}
-            />
-          </div>
+          {imageSrc && (
+            <div
+              {...imageResizeProps}
+              className={`image-resize-box${imageResizeProps ? ' is-resizable' : ''}${imageResizeProps?.className ? ` ${imageResizeProps.className}` : ''}`}
+              style={{ width: `${imageDisplaySize.width}px`, height: `${imageDisplaySize.height}px`, ...imageResizeProps?.style }}
+            >
+              <img
+                ref={imageRef}
+                className="viewer-image"
+                src={imageSrc}
+                alt={fileName === 'steve-jobs.png' ? 'Sample image' : fileName}
+                style={{ width: `${imageDisplaySize.width}px`, height: `${imageDisplaySize.height}px`, objectFit: 'fill' }}
+                onLoad={onImageLoad}
+                draggable={false}
+              />
+            </div>
+          )}
           {stageProps && <span className="drop-message">Drop an image to open it</span>}
         </div>
       </div>
@@ -223,8 +227,8 @@ function MacWindow({ fileName, imageSrc, imageDisplaySize, uiScale, stageStyle, 
   )
 }
 
-function App() {
-  const [imageSrc, setImageSrc] = useState(SAMPLE_IMAGE)
+function useImageViewer() {
+  const [imageSrc, setImageSrc] = useState<string | null>(SAMPLE_IMAGE)
   const [fileName, setFileName] = useState('steve-jobs.png')
   const [imageDisplaySize, setImageDisplaySize] = useState<WindowSize>({ width: 627, height: 470 })
   const [imageSizeFields, setImageSizeFields] = useState({ width: '627', height: '470' })
@@ -241,6 +245,7 @@ function App() {
   const [exportFormat, setExportFormat] = useState<ExportFormat>('image/png')
   const [exportStatus, setExportStatus] = useState<ExportStatus>('idle')
   const [exportPreset, setExportPreset] = useState<ExportPreset>('original')
+  const [exportSize, setExportSize] = useState<WindowSize>({ width: 760, height: 610 })
   const [exportSizeFields, setExportSizeFields] = useState({ width: '', height: '' })
   const [exportZoomPercent, setExportZoomPercent] = useState(100)
   const [sidebarMode, setSidebarMode] = useState<SidebarMode>('settings')
@@ -268,13 +273,10 @@ function App() {
   const sidebarDragSessionRef = useRef<DragSession | null>(null)
   const imageAspectRatioRef = useRef(imageDisplaySize.width / imageDisplaySize.height)
   const windowAspectRatioRef = useRef(windowSize.width / windowSize.height)
-  const exportBaseWindowSizeRef = useRef(windowSize)
-  const exportBaseImageSizeRef = useRef(imageDisplaySize)
-  const exportBasePaddingRef = useRef(padding)
-  const exportBasePaddingPresetRef = useRef(paddingPreset)
+  const exportAspectRatioRef = useRef(exportSize.width / exportSize.height)
   const settingsPreviewFitScale = Math.min(1, EXPORT_VIEWPORT.width / windowSize.width, 780 / windowSize.height)
   const settingsPreviewScale = settingsPreviewFitScale
-  const exportPreviewFitScale = Math.min(1, (EXPORT_VIEWPORT.width - 24) / windowSize.width, (EXPORT_VIEWPORT.height - 24) / windowSize.height)
+  const exportPreviewFitScale = Math.min(1, (EXPORT_VIEWPORT.width - 24) / exportSize.width, (EXPORT_VIEWPORT.height - 24) / exportSize.height)
   const exportPreviewScale = exportPreviewFitScale * (exportZoomPercent / 100)
   const windowUiScale = Math.max(1, windowSize.width / 760)
   const stagePadding = windowResizeMode === 'padding' ? padding : stagePaddingForWindow(padding, windowSize)
@@ -283,6 +285,17 @@ function App() {
     '--stage-side-padding': `${stagePadding.side}px`,
     '--stage-bottom-padding': `${stagePadding.bottom}px`,
   } as CSSProperties
+  const exportScale = exportSize.width / windowSize.width
+  const exportImageDisplaySize = {
+    width: Math.max(1, Math.round(imageDisplaySize.width * exportScale)),
+    height: Math.max(1, Math.round(imageDisplaySize.height * exportScale)),
+  }
+  const exportStageStyle = {
+    '--stage-top-padding': `${Math.round(stagePadding.top * exportScale)}px`,
+    '--stage-side-padding': `${Math.round(stagePadding.side * exportScale)}px`,
+    '--stage-bottom-padding': `${Math.round(stagePadding.bottom * exportScale)}px`,
+  } as CSSProperties
+  const exportWindowUiScale = windowUiScale * exportScale
   const viewerStyle = {
     width: `${windowSize.width}px`,
     height: `${windowSize.height}px`,
@@ -306,30 +319,63 @@ function App() {
     }
   }, [])
 
-  const applyWindowSize = (nextSize: WindowSize) => {
+  const setWindowDimensions = (nextSize: WindowSize, preserveFields = false) => {
     const constrainedSize = clampWindowSize(nextSize, WINDOW_BOUNDS)
     setWindowSize(constrainedSize)
-    setSizeFields({ width: String(constrainedSize.width), height: String(constrainedSize.height) })
+    if (!preserveFields) {
+      setSizeFields({ width: String(constrainedSize.width), height: String(constrainedSize.height) })
+    }
+    return constrainedSize
   }
 
-  useEffect(() => {
-    if (windowResizeMode !== 'padding') return
-    applyWindowSize(contentWindowSizeForImage(imageDisplaySize.width, imageDisplaySize.height, padding))
-  }, [imageDisplaySize, padding, windowResizeMode])
+  const setImageDimensions = (nextSize: WindowSize) => {
+    setImageDisplaySize(nextSize)
+    setImageSizeFields({ width: String(Math.round(nextSize.width)), height: String(Math.round(nextSize.height)) })
+  }
 
-  useEffect(() => {
+  const applyWindowSize = (nextSize: WindowSize, preserveFields = false) => {
+    const constrainedSize = setWindowDimensions(nextSize, preserveFields)
     if (windowResizeMode === 'padding') return
-    const maxWidth = Math.max(1, windowSize.width - stagePadding.side * 2)
-    const maxHeight = Math.max(1, windowSize.height - WINDOW_BAR_HEIGHT * windowUiScale - stagePadding.top - stagePadding.bottom)
-    setImageDisplaySize((currentSize) => {
-      const nextSize = isWindowAspectLocked
-        ? imageSizeWithin(currentSize.width, currentSize.height, maxWidth, maxHeight) ?? currentSize
-        : { width: Math.min(currentSize.width, maxWidth), height: Math.min(currentSize.height, maxHeight) }
-      if (nextSize.width === currentSize.width && nextSize.height === currentSize.height) return currentSize
-      setImageSizeFields({ width: String(Math.round(nextSize.width)), height: String(Math.round(nextSize.height)) })
-      return nextSize
+    const fittedImageSize = imageSizeForWindow(imageDisplaySize, constrainedSize, padding, isWindowAspectLocked)
+    if (fittedImageSize.width !== imageDisplaySize.width || fittedImageSize.height !== imageDisplaySize.height) {
+      setImageDimensions(fittedImageSize)
+    }
+  }
+
+  const applyImageSize = (nextSize: WindowSize, lockedDimension?: keyof WindowSize) => {
+    const maxWidth = windowResizeMode === 'padding' ? 4096 : Math.max(1, windowSize.width - stagePadding.side * 2)
+    const maxHeight = windowResizeMode === 'padding'
+      ? 4096
+      : Math.max(1, windowSize.height - WINDOW_BAR_HEIGHT * windowUiScale - stagePadding.top - stagePadding.bottom)
+    const constrainedSize = isImageAspectLocked && lockedDimension
+      ? imageSizeAtAspect(nextSize[lockedDimension], lockedDimension, imageAspectRatioRef.current, maxWidth, maxHeight)
+      : {
+          width: Math.min(maxWidth, Math.max(1, Math.round(nextSize.width))),
+          height: Math.min(maxHeight, Math.max(1, Math.round(nextSize.height))),
+        }
+    setImageDimensions(constrainedSize)
+    if (windowResizeMode === 'padding') {
+      setWindowDimensions(contentWindowSizeForImage(constrainedSize.width, constrainedSize.height, padding))
+    }
+  }
+
+  const applyPadding = (nextPadding: Padding, nextPreset: PaddingPreset) => {
+    setPaddingPreset(nextPreset)
+    setPadding(nextPadding)
+    setPaddingFields({
+      top: String(nextPadding.top),
+      side: String(nextPadding.side),
+      bottom: String(nextPadding.bottom),
     })
-  }, [isWindowAspectLocked, windowResizeMode, stagePadding.bottom, stagePadding.side, stagePadding.top, windowSize.height, windowSize.width, windowUiScale])
+    if (windowResizeMode === 'padding') {
+      setWindowDimensions(contentWindowSizeForImage(imageDisplaySize.width, imageDisplaySize.height, nextPadding))
+      return
+    }
+    const fittedImageSize = imageSizeForWindow(imageDisplaySize, windowSize, nextPadding, isWindowAspectLocked)
+    if (fittedImageSize.width !== imageDisplaySize.width || fittedImageSize.height !== imageDisplaySize.height) {
+      setImageDimensions(fittedImageSize)
+    }
+  }
 
   const loadFile = (file?: File) => {
     if (!file || !file.type.startsWith('image/')) return
@@ -344,6 +390,13 @@ function App() {
   const handleFileChange = (event: ChangeEvent<HTMLInputElement>) => {
     loadFile(event.target.files?.[0])
     event.target.value = ''
+  }
+
+  const clearImage = () => {
+    if (objectUrlRef.current) URL.revokeObjectURL(objectUrlRef.current)
+    objectUrlRef.current = null
+    setImageSrc(null)
+    setFileName('window')
   }
 
   const handleDrop = (event: DragEvent<HTMLDivElement>) => {
@@ -374,10 +427,9 @@ function App() {
       EXPORT_VIEWPORT.height - padding.top - padding.bottom - WINDOW_BAR_HEIGHT,
     )
     if (!fittedImageSize) return
-    setImageDisplaySize(fittedImageSize)
-    setImageSizeFields({ width: String(fittedImageSize.width), height: String(fittedImageSize.height) })
+    setImageDimensions(fittedImageSize)
     if (isImageAspectLocked) imageAspectRatioRef.current = fittedImageSize.width / fittedImageSize.height
-    applyWindowSize(contentWindowSizeForImage(fittedImageSize.width, fittedImageSize.height, padding))
+    setWindowDimensions(contentWindowSizeForImage(fittedImageSize.width, fittedImageSize.height, padding))
   }
 
   const handleImageLoad = (event: SyntheticEvent<HTMLImageElement>) => {
@@ -391,21 +443,28 @@ function App() {
 
     if (isWindowAspectLocked) {
       const nextSize = windowSizeAtAspect(numericValue, dimension, windowAspectRatioRef.current)
-      setWindowSize(nextSize)
+      applyWindowSize(nextSize, true)
       setSizeFields((currentFields) => ({
         ...currentFields,
-        [dimension]: value,
         [dimension === 'width' ? 'height' : 'width']: String(nextSize[dimension === 'width' ? 'height' : 'width']),
       }))
       return
     }
 
-    setWindowSize((currentSize) => clampWindowSize({ ...currentSize, [dimension]: numericValue }, WINDOW_BOUNDS))
+    applyWindowSize({ ...windowSize, [dimension]: numericValue }, true)
   }
 
   const handleWindowAspectLockChange = (checked: boolean) => {
     if (checked) windowAspectRatioRef.current = windowSize.width / windowSize.height
     setIsWindowAspectLocked(checked)
+  }
+
+  const handleWindowResizeModeChange = (value: string) => {
+    const nextMode = value as WindowResizeMode
+    setWindowResizeMode(nextMode)
+    if (nextMode === 'padding') {
+      setWindowDimensions(contentWindowSizeForImage(imageDisplaySize.width, imageDisplaySize.height, padding))
+    }
   }
 
   const handleImageDimensionChange = (dimension: keyof WindowSize, value: string) => {
@@ -419,17 +478,12 @@ function App() {
       : Math.max(1, windowSize.height - WINDOW_BAR_HEIGHT * windowUiScale - stagePadding.top - stagePadding.bottom)
     if (isImageAspectLocked) {
       const nextSize = imageSizeAtAspect(numericValue, dimension, imageAspectRatioRef.current, maxWidth, maxHeight)
-      setImageDisplaySize(nextSize)
-      setImageSizeFields((currentFields) => ({
-        ...currentFields,
-        [dimension]: value,
-        [dimension === 'width' ? 'height' : 'width']: String(nextSize[dimension === 'width' ? 'height' : 'width']),
-      }))
+      applyImageSize(nextSize, dimension)
       return
     }
 
     const maxValue = dimension === 'width' ? maxWidth : maxHeight
-    setImageDisplaySize((currentSize) => ({ ...currentSize, [dimension]: Math.min(maxValue, Math.round(numericValue)) }))
+    applyImageSize({ ...imageDisplaySize, [dimension]: Math.min(maxValue, Math.round(numericValue)) })
   }
 
   const handleImageAspectLockChange = (checked: boolean) => {
@@ -437,31 +491,10 @@ function App() {
     setIsImageAspectLocked(checked)
   }
 
-  const applyImageSize = (nextSize: WindowSize, lockedDimension?: keyof WindowSize) => {
-    const maxWidth = windowResizeMode === 'padding' ? 4096 : Math.max(1, windowSize.width - stagePadding.side * 2)
-    const maxHeight = windowResizeMode === 'padding'
-      ? 4096
-      : Math.max(1, windowSize.height - WINDOW_BAR_HEIGHT * windowUiScale - stagePadding.top - stagePadding.bottom)
-    const constrainedSize = isImageAspectLocked && lockedDimension
-      ? imageSizeAtAspect(nextSize[lockedDimension], lockedDimension, imageAspectRatioRef.current, maxWidth, maxHeight)
-      : {
-          width: Math.min(maxWidth, Math.max(1, Math.round(nextSize.width))),
-          height: Math.min(maxHeight, Math.max(1, Math.round(nextSize.height))),
-        }
-    setImageDisplaySize(constrainedSize)
-    setImageSizeFields({ width: String(constrainedSize.width), height: String(constrainedSize.height) })
-  }
-
   const applyPaddingPreset = (preset: Exclude<PaddingPreset, 'custom'>) => {
     const selectedPadding = PADDING_PRESETS[preset]
     const nextPadding = isVerticalPaddingLinked ? { ...selectedPadding, bottom: selectedPadding.top } : selectedPadding
-    setPaddingPreset(preset)
-    setPadding(nextPadding)
-    setPaddingFields({
-      top: String(nextPadding.top),
-      side: String(nextPadding.side),
-      bottom: String(nextPadding.bottom),
-    })
+    applyPadding(nextPadding, preset)
   }
 
   const handlePaddingPresetChange = (value: string) => {
@@ -473,7 +506,6 @@ function App() {
   }
 
   const handlePaddingChange = (dimension: keyof Padding, value: string) => {
-    setPaddingPreset('custom')
     const updateVerticalPadding = isVerticalPaddingLinked && (dimension === 'top' || dimension === 'bottom')
     setPaddingFields((currentFields) => updateVerticalPadding
       ? { ...currentFields, top: value, bottom: value }
@@ -481,17 +513,18 @@ function App() {
     const numericValue = Number(value)
     if (!Number.isFinite(numericValue) || numericValue < 0) return
     const constrainedValue = Math.min(4096, Math.round(numericValue))
-    setPadding((currentPadding) => updateVerticalPadding
-      ? { ...currentPadding, top: constrainedValue, bottom: constrainedValue }
-      : { ...currentPadding, [dimension]: constrainedValue })
+    applyPadding(
+      updateVerticalPadding
+        ? { ...padding, top: constrainedValue, bottom: constrainedValue }
+        : { ...padding, [dimension]: constrainedValue },
+      'custom',
+    )
   }
 
   const handleVerticalPaddingLinkChange = (checked: boolean) => {
     setIsVerticalPaddingLinked(checked)
     if (!checked) return
-    setPaddingPreset('custom')
-    setPadding((currentPadding) => ({ ...currentPadding, bottom: currentPadding.top }))
-    setPaddingFields((currentFields) => ({ ...currentFields, bottom: currentFields.top }))
+    applyPadding({ ...padding, bottom: padding.top }, 'custom')
   }
 
   const applyResizePadding = (nextPadding: Padding) => {
@@ -503,13 +536,7 @@ function App() {
     const appliedPadding = isVerticalPaddingLinked
       ? { ...constrainedPadding, bottom: constrainedPadding.top }
       : constrainedPadding
-    setPaddingPreset('custom')
-    setPadding(appliedPadding)
-    setPaddingFields({
-      top: String(appliedPadding.top),
-      side: String(appliedPadding.side),
-      bottom: String(appliedPadding.bottom),
-    })
+    applyPadding(appliedPadding, 'custom')
   }
 
   const applyShadowPreset = (preset: Exclude<ShadowPreset, 'custom'>) => {
@@ -698,22 +725,22 @@ function App() {
     const exportWindow = exportWindowRef.current
     if (!exportWindow) return
 
-    const width = windowSize.width
-    const height = windowSize.height
+    const width = exportSize.width
+    const height = exportSize.height
     if (!width || !height || width < 1 || height < 1) return
 
     setExportStatus('exporting')
     try {
       await document.fonts?.ready
       const { toCanvas } = await import('html-to-image')
-      const captureSize = exportCaptureSize(windowSize, windowShadow)
+      const captureSize = exportCaptureSize(exportSize, windowShadow)
       const output = await toCanvas(exportWindow, {
         width: captureSize.width,
         height: captureSize.height,
         canvasWidth: captureSize.width,
         canvasHeight: captureSize.height,
         pixelRatio: 1,
-        cacheBust: true,
+        cacheBust: !imageSrc?.startsWith('blob:'),
         style: {
           width: `${width}px`,
           height: `${height}px`,
@@ -744,25 +771,12 @@ function App() {
     const nextPreset = value as ExportPreset
     setExportPreset(nextPreset)
     if (nextPreset === 'custom') return
-    const baseWindowSize = exportBaseWindowSizeRef.current
-    const size = exportSizeForPreset(baseWindowSize.width, baseWindowSize.height, nextPreset)
+    const size = exportSizeForPreset(windowSize.width, windowSize.height, nextPreset)
     if (!size) return
 
-    const scale = size.width / baseWindowSize.width
-    const baseImageSize = exportBaseImageSizeRef.current
-    const basePadding = exportBasePaddingRef.current
-    applyWindowSize(size)
+    exportAspectRatioRef.current = size.width / size.height
+    setExportSize(size)
     setExportSizeFields({ width: String(size.width), height: String(size.height) })
-    setImageDisplaySize({ width: Math.round(baseImageSize.width * scale), height: Math.round(baseImageSize.height * scale) })
-    setImageSizeFields({ width: String(Math.round(baseImageSize.width * scale)), height: String(Math.round(baseImageSize.height * scale)) })
-    const scaledPadding = {
-      top: Math.round(basePadding.top * scale),
-      side: Math.round(basePadding.side * scale),
-      bottom: Math.round(basePadding.bottom * scale),
-    }
-    setPadding(scaledPadding)
-    setPaddingFields({ top: String(scaledPadding.top), side: String(scaledPadding.side), bottom: String(scaledPadding.bottom) })
-    setPaddingPreset(nextPreset === 'original' ? exportBasePaddingPresetRef.current : 'custom')
   }
 
   const handleExportSizeChange = (dimension: keyof WindowSize, value: string) => {
@@ -772,17 +786,17 @@ function App() {
     if (!Number.isFinite(numericValue) || numericValue < 1) {
       return
     }
-    applyWindowSize({ ...windowSize, [dimension]: numericValue })
+    const nextSize = imageSizeAtAspect(numericValue, dimension, exportAspectRatioRef.current, WINDOW_LIMITS.maxWidth, WINDOW_LIMITS.maxHeight)
+    setExportSize(nextSize)
+    setExportSizeFields({ width: String(nextSize.width), height: String(nextSize.height) })
   }
 
   const handleSidebarModeChange = (value: string) => {
     const nextMode = value as SidebarMode
     if (nextMode === 'export' && sidebarMode !== 'export') {
-      exportBaseWindowSizeRef.current = windowSize
-      exportBaseImageSizeRef.current = imageDisplaySize
-      exportBasePaddingRef.current = padding
-      exportBasePaddingPresetRef.current = paddingPreset
       setExportPreset('original')
+      exportAspectRatioRef.current = windowSize.width / windowSize.height
+      setExportSize(windowSize)
       setExportSizeFields({ width: String(windowSize.width), height: String(windowSize.height) })
     }
     setSidebarMode(nextMode)
@@ -873,24 +887,24 @@ function App() {
                 <div
                   className="export-window-frame"
                   data-testid="export-window-frame"
-                  data-export-width={windowSize.width}
-                  data-export-height={windowSize.height}
+                  data-export-width={exportSize.width}
+                  data-export-height={exportSize.height}
                   data-preview-zoom={exportZoomPercent}
                   data-render-scale={exportPreviewScale}
                   style={{
-                    width: `${windowSize.width}px`,
-                    height: `${windowSize.height}px`,
+                    width: `${exportSize.width}px`,
+                    height: `${exportSize.height}px`,
                     transform: `translate(-50%, -50%) scale(${exportPreviewScale})`,
                     '--window-shadow': `0 ${windowShadow.y}px ${windowShadow.blur}px rgba(0, 0, 0, ${windowShadow.opacity})`,
-                    '--window-ui-scale': windowUiScale,
+                    '--window-ui-scale': exportWindowUiScale,
                   } as CSSProperties}
                 >
                   <MacWindow
                     fileName={fileName}
                     imageSrc={imageSrc}
-                    imageDisplaySize={imageDisplaySize}
-                    uiScale={windowUiScale}
-                    stageStyle={stageStyle}
+                    imageDisplaySize={exportImageDisplaySize}
+                    uiScale={exportWindowUiScale}
+                    stageStyle={exportStageStyle}
                     windowRef={exportWindowRef}
                   />
                 </div>
@@ -966,42 +980,53 @@ function App() {
                   Open image
                 </Button>
               </Tooltip>
-              <Tooltip content="Fit the window to the image">
-                <Button variant="outline" size="sm" className="control-button control-button-compact" onClick={() => fitWindowToImage()}>
-                  <Scan />
-                  Fit window
-                </Button>
-              </Tooltip>
+              {imageSrc && (
+                <>
+                  <Tooltip content="Fit the window to the image">
+                    <Button variant="outline" size="sm" className="control-button control-button-compact" onClick={() => fitWindowToImage()}>
+                      <Scan />
+                      Fit window
+                    </Button>
+                  </Tooltip>
+                  <Button variant="outline" size="sm" className="control-button control-button-compact" onClick={clearImage}>
+                    No image
+                  </Button>
+                </>
+              )}
               <label className="dimension-field file-name-field">
-                <span>File name</span>
+                <span>{imageSrc ? 'File name' : 'Window title'}</span>
                 <input
                   type="text"
-                  aria-label="File name"
+                  aria-label={imageSrc ? 'File name' : 'Window title'}
                   value={fileName}
                   onChange={(event) => setFileName(event.target.value)}
                 />
               </label>
-              <div className="field-row">
-                <label className="dimension-field">
-                  <span>Image W</span>
-                  <input type="number" inputMode="numeric" min="1" aria-label="Image width" value={imageSizeFields.width} onChange={(event) => handleImageDimensionChange('width', event.target.value)} onBlur={() => setImageSizeFields({ width: String(Math.round(imageDisplaySize.width)), height: String(Math.round(imageDisplaySize.height)) })} />
-                </label>
-                <label className="dimension-field">
-                  <span>Image H</span>
-                  <input type="number" inputMode="numeric" min="1" aria-label="Image height" value={imageSizeFields.height} onChange={(event) => handleImageDimensionChange('height', event.target.value)} onBlur={() => setImageSizeFields({ width: String(Math.round(imageDisplaySize.width)), height: String(Math.round(imageDisplaySize.height)) })} />
-                </label>
-              </div>
-              <div className="image-aspect-row">
-                <span>Lock aspect ratio</span>
-                <Switch.Root className="padding-link-switch" aria-label="Lock image aspect ratio" checked={isImageAspectLocked} onCheckedChange={handleImageAspectLockChange}>
-                  <Switch.Thumb className="padding-link-thumb" />
-                </Switch.Root>
-              </div>
+              {imageSrc && (
+                <>
+                  <div className="field-row">
+                    <label className="dimension-field">
+                      <span>Image W</span>
+                      <input type="number" inputMode="numeric" min="1" aria-label="Image width" value={imageSizeFields.width} onChange={(event) => handleImageDimensionChange('width', event.target.value)} onBlur={() => setImageSizeFields({ width: String(Math.round(imageDisplaySize.width)), height: String(Math.round(imageDisplaySize.height)) })} />
+                    </label>
+                    <label className="dimension-field">
+                      <span>Image H</span>
+                      <input type="number" inputMode="numeric" min="1" aria-label="Image height" value={imageSizeFields.height} onChange={(event) => handleImageDimensionChange('height', event.target.value)} onBlur={() => setImageSizeFields({ width: String(Math.round(imageDisplaySize.width)), height: String(Math.round(imageDisplaySize.height)) })} />
+                    </label>
+                  </div>
+                  <div className="image-aspect-row">
+                    <span>Lock aspect ratio</span>
+                    <Switch.Root className="padding-link-switch" aria-label="Lock image aspect ratio" checked={isImageAspectLocked} onCheckedChange={handleImageAspectLockChange}>
+                      <Switch.Thumb className="padding-link-thumb" />
+                    </Switch.Root>
+                  </div>
+                </>
+              )}
             </section>
 
             <section className="settings-section">
               <p className="settings-label">Window</p>
-              <Tabs value={windowResizeMode} size="compact" onValueChange={(value) => setWindowResizeMode(value as WindowResizeMode)}>
+              <Tabs value={windowResizeMode} size="compact" onValueChange={handleWindowResizeModeChange}>
                 <TabsList className="mode-tabs" aria-label="Window resize behavior">
                   <TabItem value="size" label="Size" className="flex-1 justify-center" />
                   <TabItem value="padding" label="Padding" className="flex-1 justify-center" />
@@ -1139,6 +1164,10 @@ function App() {
       </TooltipProvider>
     </main>
   )
+}
+
+function App() {
+  return useImageViewer()
 }
 
 export default App
